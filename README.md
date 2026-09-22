@@ -110,17 +110,26 @@ validation requires a matching native PickCube checkpoint and normalization stat
 
 ### VLA runtime environment (LIBERO-Pro or RoboCasa)
 
-`scripts/deployment/install_vla_env.sh` builds a venv for one of two tracks;
-the tracks cannot share a venv state (incompatible `robosuite` versions). See
+`scripts/deployment/install_vla_env.sh` installs host packages, shared Python
+dependencies, and independently selected simulator/model components. LIBERO-Pro
+and RoboCasa cannot share a venv state because they require incompatible
+`robosuite` versions, but either environment may be paired with either model. See
 the [VLA runtime setup guide](scripts/deployment/VLA_ENV_SETUP.md) for the full
 installation notes, compatibility fixes, and known limitations.
+
+The installer uses `uv` for the complete Python lifecycle: it downloads managed
+Python 3.11, creates the venv, and installs every Python dependency. It does not
+use the host Python or `python -m pip`.
+
+For slow or restricted networks, add `--use-mirror` to use the RLinf-compatible
+Aliyun PyPI, Hugging Face, Python-build, and GitHub proxy mirrors.
 
 **LIBERO-Pro + Pi0.5**
 
 ```bash
 export REPO_ROOT=/abs/path/to/Zetta-Embodiment
 export VENV_ROOT=/abs/path/to/venvs/vla-env
-bash scripts/deployment/install_vla_env.sh --track libero-pro
+bash scripts/deployment/install_vla_env.sh --env libero-pro --model openpi
 ```
 
 `install_vla_env.sh` downloads the LIBERO-Pro scene/object assets automatically. To fetch or refresh them manually:
@@ -135,8 +144,13 @@ bash scripts/deployment/install_vla_env.sh --track libero-pro
 export REPO_ROOT=/abs/path/to/Zetta-Embodiment
 export VENV_ROOT=/abs/path/to/venvs/vla-env
 export ROBOCASA_SRC_ROOT=/abs/path/to/robocasa-source-checkout
-bash scripts/deployment/install_vla_env.sh --track robocasa
+bash scripts/deployment/install_vla_env.sh --env robocasa --model gr00t
 ```
+
+By default the installer uses `apt-get` (and `sudo` for non-root users) to install
+the compiler, Git, ffmpeg, EGL, and OpenGL packages. Pass `--no-system-deps` only
+when equivalent host packages are already installed; the script still checks
+them and warns about anything missing.
 
 RoboCasa also needs its kitchen assets (~10GB); see the [RoboCasa installation guide](https://robocasa.ai/docs/build/html/introduction/installation.html) for details:
 
@@ -147,7 +161,7 @@ python -m robocasa.scripts.download_kitchen_assets   # downloads ~10GB of kitche
 
 **RoboTwin 2.0 + Pi0.5**
 
-RoboTwin is SAPIEN-based and cannot share a venv with either track above. Use the
+RoboTwin is SAPIEN-based and cannot share a venv with either simulator above. Use the
 upstream RLinf image rather than building one:
 
 ```bash

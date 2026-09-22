@@ -1,551 +1,483 @@
 #!/usr/bin/env bash
-# install_vla_env.sh
-#
-# Build a standalone venv for online VLA inference from scratch. Two tracks are supported:
-#   --track libero-pro   LIBERO-Pro simulation + Pi0.5 (Zetta OpenPI backend)
-#   --track robocasa     RoboCasa simulation + GR00T
-#
-# Every step in this script corresponds to a command executed and validated on a real GPU
-# host, including fixes for several bugs encountered along the way (not theoretical
-# speculation). See VLA_ENV_SETUP.md in this directory for the full background.
-#
-# The two tracks share most of their infrastructure (venv creation, mujoco==3.3.1,
-# installation of this repository's rollout_runtime, the pydantic/numpydantic fix,
-# and the robocasa/gr00t top-level package shadowing fix). They are mutually exclusive
-# at the code level in one place and must branch there:
-#
-#   robosuite version: LIBERO-Pro's liberopro.liberopro.envs.bddl_base_domain.
-#   BDDLBaseDomain directly inherits robosuite.environments.manipulation.
-#   single_arm_env.SingleArmEnv (this class was removed entirely in robosuite==1.5.x
-#   and refactored into manipulation_env.ManipulationEnv), while RoboCasa requires the
-#   PandaOmron robot class introduced in robosuite>=1.5.0. The two cannot coexist in
-#   the same venv state; select one with the --track argument.
-#
-# Validated combinations (independently tested for both tracks on the same machine
-# with a single GPU):
-#   libero-pro: mujoco==3.3.1 + robosuite==1.4.1 + rpent-liberopro==0.1.1
-#               + rlinf-openpi==0.1.1 (real openpi/pi0.5 inference)
-#   robocasa:   mujoco==3.3.1 + robosuite==1.5.2 + robocasa==1.0.1
-#               + gr00t==1.1.0 + flash-attn==2.8.3
-#
-# ROBOCASA_SRC_ROOT compatibility matrix (robocasa track only):
-#
-#   robosuite/, robocasa/, and Isaac-GR00T/ under ROBOCASA_SRC_ROOT are installed
-#   editable straight from source (see step 3/9, 3.1/9, 5/9 below) -- none of the
-#   three publish to PyPI for this track, and nothing in this script told you which
-#   commit/branch of each repo produces the versions pinned above (the "robosuite
-#   is not 1.5.x" / "robocasa's kitchen.py needs PandaOmron" checks below only
-#   catch the mismatch after checkout + install + pip's dependency resolution has
-#   already run, i.e. late). Check out exactly these refs instead of "main":
-#
-#     robosuite/    https://github.com/ARISE-Initiative/robosuite
-#                   tag v1.5.2 (824ac14cefcfb7ec125fe5eb2e0bad7364466154) -> robosuite==1.5.2
-#     robocasa/     https://github.com/robocasa/robocasa
-#                   commit 29f7ce8814c1547f5af762a0997fbd4b64848dd7 -> robocasa==1.0.1
-#     Isaac-GR00T/  https://github.com/NVIDIA/Isaac-GR00T
-#                   tag n1.5-release (4af2b622892f7dcb5aae5a3fb70bcb02dc217b96) -> gr00t==1.1.0
-#
-#   e.g.:
-#     git clone https://github.com/ARISE-Initiative/robosuite "$ROBOCASA_SRC_ROOT/robosuite" \
-#       && git -C "$ROBOCASA_SRC_ROOT/robosuite" checkout v1.5.2
-#     git clone https://github.com/robocasa/robocasa "$ROBOCASA_SRC_ROOT/robocasa" \
-#       && git -C "$ROBOCASA_SRC_ROOT/robocasa" checkout 29f7ce8814c1547f5af762a0997fbd4b64848dd7
-#     git clone https://github.com/NVIDIA/Isaac-GR00T "$ROBOCASA_SRC_ROOT/Isaac-GR00T" \
-#       && git -C "$ROBOCASA_SRC_ROOT/Isaac-GR00T" checkout n1.5-release
-#
-#   Notes on how these three refs were picked (each repo versions differently,
-#   and none of it is obvious from a fresh checkout):
-#     - robosuite tags its releases 1:1 with the PyPI-style version string, so
-#       v1.5.2 is unambiguous.
-#     - robocasa has no v1.0.1 tag -- only v1.0 (== 1.0.0) and v0.2 exist. The
-#       commit above is the earliest one on its main branch whose setup.py
-#       already reads version="1.0.1"; anything from that commit onward
-#       reports the same version.
-#     - Isaac-GR00T's release tags do NOT correlate with the version string in
-#       pyproject.toml (n1.6-release and n1.7-release both report 0.1.0);
-#       n1.5-release is the only tag whose pyproject.toml reports 1.1.0. As a
-#       cross-check, n1.5-release's own pyproject.toml independently pins
-#       pydantic==2.10.6 and transformers==4.51.3 -- exactly the versions
-#       steps 5.3/9 and 5.4/9 below force-reinstall after GR00T's own install
-#       runs. If you check out a different Isaac-GR00T ref and that agreement
-#       breaks, treat it as a signal you have the wrong commit, not as this
-#       script being wrong.
-#   These refs were resolved by matching each project's own reported version
-#   string against its GitHub tag/commit history, not by re-running this exact
-#   three-repo combination through this script end to end -- if you hit a new
-#   failure with the exact refs above, it is real, not "just try a different
-#   commit."
-#
-# Usage:
-#   REPO_ROOT=/abs/path/to/Zetta-Embodiment \
-#   VENV_ROOT=/abs/path/to/venvs/vla-env \
-#     bash install_vla_env.sh --track libero-pro
-#
-#   REPO_ROOT=/abs/path/to/Zetta-Embodiment \
-#   VENV_ROOT=/abs/path/to/venvs/vla-env \
-#   ROBOCASA_SRC_ROOT=/abs/path/to/robocasa-source-checkout \
-#     bash install_vla_env.sh --track robocasa
-#
-# Optional environment variables:
-#   PYTHON_BIN            Path to the system python3.10 executable (default: python3.10)
-#   LIBERO_COMPOSITE_ASSETS_DIR
-#                         libero-pro track only: destination for the composite asset
-#                         tree (robosuite robot models + LIBERO-Pro scene/object assets).
-#                         Defaults to $VENV_ROOT/libero-pro-composite-assets. For a real
-#                         rollout, set LIBERO_ASSETS_ROOT_OVERRIDE to this directory
-#                         (see the "Next steps" example below). Do not use the raw output
-#                         of liberopro-download-assets alone: it does not include the
-#                         robot models bundled with robosuite (such as
-#                         robots/panda/robot.xml), so environment reset would raise
-#                         FileNotFoundError.
-#   LIBERO_CONFIG_PATH    libero-pro track only: directory for liberopro's config.yaml.
-#                         Defaults to $VENV_ROOT/.liberopro-config so validation cannot
-#                         silently reuse another environment's user-global config.
-#   LIBERO_PRO_ASSET_PATH
-#                         libero-pro track only: an existing raw or composite assets
-#                         tree to link instead of downloading from Hugging Face. This is
-#                         the upstream liberopro-download-assets offline input.
-#   SKIP_ASSET_DOWNLOAD   Set to 1 to skip downloading LIBERO-Pro assets and building
-#                         the composite asset tree (libero-pro track; use when the
-#                         assets have already been prepared elsewhere)
-#   ROBOCASA_SRC_ROOT     Required for the robocasa track: root of a source checkout
-#                         containing the robocasa/, robosuite/, and Isaac-GR00T/
-#                         subdirectories (each is an editable installation source).
-#                         See the "ROBOCASA_SRC_ROOT compatibility matrix" section
-#                         above for the exact git ref each subdirectory must be
-#                         checked out to.
-#   FLASH_ATTN_WHEEL      Optional for the robocasa track: local path or URL of a
-#                         prebuilt flash-attn wheel. By default, the version table below
-#                         is used to construct a GitHub Release URL. Set this explicitly
-#                         when the build host cannot reach github.com (an internal mirror
-#                         or file:// path may be used)
-#   LIBEROPRO_PACKAGE     Optional for the libero-pro track: pip requirement for the
-#                         upstream LIBERO-Pro package. Defaults to
-#                         rpent-liberopro==0.1.1;
-#                         override it with a full URL when using an internal mirror.
-#
-# Prerequisites (validated on Ubuntu 22.04; verify package names on other distributions):
-#   - python3.10 + python3.10-venv
-#   - build-essential (gcc is required to compile numba/native extensions)
-#   - libegl1-mesa-dev / libgl1-mesa-dev (MuJoCo EGL offscreen rendering)
-#   - git (required to install RoboCasa / robosuite / GR00T from source)
-#   - NVIDIA driver installed and `nvidia-smi` available; CUDA 12.6 series
-#     (torch==2.7.1+cu126)
-#
-# Outside this script's scope and must be provided by the user:
-#   - VLA checkpoint (the actual weight file referenced by --model-path)
-#   - Source checkout for the robocasa track (ROBOCASA_SRC_ROOT)
-
+# Layered VLA installer: host dependencies -> common Python -> env -> model.
 set -euo pipefail
 
-REPO_ROOT="${REPO_ROOT:?Set REPO_ROOT to the Zetta-Embodiment repository checkout}"
-VENV_ROOT="${VENV_ROOT:?Set VENV_ROOT to the target venv path (will be created)}"
-PYTHON_BIN="${PYTHON_BIN:-python3.10}"
-SKIP_ASSET_DOWNLOAD="${SKIP_ASSET_DOWNLOAD:-0}"
+SELECTED_ENV=""
+SELECTED_MODEL=""
+NO_SYSTEM_DEPS=0
+USE_MIRROR=0
+REPO_ROOT="${REPO_ROOT:-}"
+VENV_ROOT="${VENV_ROOT:-}"
+UV_BIN="${UV_BIN:-uv}"
+UV_PYTHON_VERSION="${UV_PYTHON_VERSION:-3.11}"
+UV_CACHE_DIR="${UV_CACHE_DIR:-}"
+UV_PYTHON_INSTALL_DIR="${UV_PYTHON_INSTALL_DIR:-}"
+GITHUB_PREFIX="${GITHUB_PREFIX:-}"
 ROBOCASA_SRC_ROOT="${ROBOCASA_SRC_ROOT:-}"
 FLASH_ATTN_WHEEL="${FLASH_ATTN_WHEEL:-}"
 LIBEROPRO_PACKAGE="${LIBEROPRO_PACKAGE:-rpent-liberopro==0.1.1}"
-LIBERO_CONFIG_PATH="${LIBERO_CONFIG_PATH:-$VENV_ROOT/.liberopro-config}"
+SKIP_ASSET_DOWNLOAD="${SKIP_ASSET_DOWNLOAD:-0}"
+LIBERO_CONFIG_PATH="${LIBERO_CONFIG_PATH:-}"
+PY=""
 
-TRACK=""
-while [ $# -gt 0 ]; do
-  case "$1" in
-    --track)
-      TRACK="$2"
-      shift 2
-      ;;
-    --track=*)
-      TRACK="${1#--track=}"
-      shift
-      ;;
-    *)
-      echo "unknown argument: $1" >&2
-      exit 1
-      ;;
-  esac
-done
+log() { printf '\n=== %s ===\n' "$*"; }
+die() { echo "ERROR: $*" >&2; exit 1; }
 
-case "$TRACK" in
-  libero-pro|robocasa) ;;
-  *)
-    echo "usage: $0 --track {libero-pro,robocasa}" >&2
-    exit 1
-    ;;
-esac
+usage() {
+  cat <<'EOF'
+Usage: install_vla_env.sh [--env ENV] [--model MODEL] [--no-system-deps] [--use-mirror]
 
-if [ "$TRACK" = "libero-pro" ]; then
-  export LIBERO_CONFIG_PATH
-fi
+Install at least one independently selectable component:
+  --env libero-pro|robocasa
+  --model openpi|gr00t
 
-log() { printf '\n=== [%s] %s ===\n' "$TRACK" "$*"; }
+Options:
+  --no-system-deps  Skip apt-get; check host dependencies and warn instead.
+  --use-mirror      Use the RLinf-compatible Aliyun/HF/GitHub proxy mirrors.
+  -h, --help        Show this help.
 
-log "0/9 Prerequisite checks"
-if [ ! -f "$REPO_ROOT/pyproject.toml" ]; then
-  echo "REPO_ROOT ($REPO_ROOT) is not a valid Zetta-Embodiment repository root (pyproject.toml is missing)" >&2
-  exit 1
-fi
-command -v "$PYTHON_BIN" >/dev/null || {
-  echo "$PYTHON_BIN was not found; install python3.10 first" >&2
-  exit 1
+Required variables: REPO_ROOT, VENV_ROOT
+Optional variables: UV_BIN, UV_PYTHON_VERSION, UV_CACHE_DIR,
+                    UV_PYTHON_INSTALL_DIR, ROBOCASA_SRC_ROOT, LIBEROPRO_PACKAGE,
+                    FLASH_ATTN_WHEEL, LIBERO_PRO_ASSET_PATH,
+                    LIBERO_COMPOSITE_ASSETS_DIR, SKIP_ASSET_DOWNLOAD
+EOF
 }
-command -v nvidia-smi >/dev/null || echo "Warning: nvidia-smi is unavailable; GPU inference will fail" >&2
-if [ "$TRACK" = "robocasa" ] && [ -z "$ROBOCASA_SRC_ROOT" ]; then
-  echo "track=robocasa requires ROBOCASA_SRC_ROOT (the source checkout root containing robocasa/, robosuite/, and Isaac-GR00T/)" >&2
-  exit 1
-fi
-if [ "$TRACK" = "robocasa" ]; then
-  for sub in robocasa robosuite Isaac-GR00T; do
-    if [ ! -d "$ROBOCASA_SRC_ROOT/$sub" ]; then
-      echo "ROBOCASA_SRC_ROOT ($ROBOCASA_SRC_ROOT) is missing the $sub/ subdirectory" >&2
-      exit 1
-    fi
+
+parse_args() {
+  SELECTED_ENV=""; SELECTED_MODEL=""; NO_SYSTEM_DEPS=0
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --env)
+        [ -z "$SELECTED_ENV" ] || die "--env may only be specified once"
+        [ "$#" -ge 2 ] || die "--env requires a value"
+        SELECTED_ENV="$2"; shift 2 ;;
+      --env=*)
+        [ -z "$SELECTED_ENV" ] || die "--env may only be specified once"
+        SELECTED_ENV="${1#--env=}"; shift ;;
+      --model)
+        [ -z "$SELECTED_MODEL" ] || die "--model may only be specified once"
+        [ "$#" -ge 2 ] || die "--model requires a value"
+        SELECTED_MODEL="$2"; shift 2 ;;
+      --model=*)
+        [ -z "$SELECTED_MODEL" ] || die "--model may only be specified once"
+        SELECTED_MODEL="${1#--model=}"; shift ;;
+      --no-system-deps) NO_SYSTEM_DEPS=1; shift ;;
+      --use-mirror) USE_MIRROR=1; shift ;;
+      -h|--help) usage; return 2 ;;
+      *) die "unknown argument: $1" ;;
+    esac
   done
-fi
+  [ -n "$SELECTED_ENV" ] || [ -n "$SELECTED_MODEL" ] || \
+    die "at least one of --env or --model must be specified"
+  case "$SELECTED_ENV" in ""|libero-pro|robocasa) ;; *) die "unsupported environment: $SELECTED_ENV" ;; esac
+  case "$SELECTED_MODEL" in ""|openpi|gr00t) ;; *) die "unsupported model: $SELECTED_MODEL" ;; esac
+}
 
-log "1/9 Create venv: $VENV_ROOT"
-if [ -d "$VENV_ROOT" ]; then
-  echo "The target directory already exists; skipping creation and reusing the interrupted installation"
-else
-  "$PYTHON_BIN" -m venv "$VENV_ROOT"
-fi
-PY="$VENV_ROOT/bin/python"
-"$PY" -m pip install --upgrade pip setuptools wheel
+require_source_directory() {
+  [ -n "$ROBOCASA_SRC_ROOT" ] || die "$1 requires ROBOCASA_SRC_ROOT"
+  [ -d "$ROBOCASA_SRC_ROOT/$1" ] || die "ROBOCASA_SRC_ROOT ($ROBOCASA_SRC_ROOT) is missing $1/"
+}
 
-log "2/9 Install mujoco==3.3.1"
-# Version 3.3.1 has been validated as fully compatible with both tracks (the 3.8.1
-# version commonly used in LIBERO-Pro production environments is not required).
-"$PY" -m pip install mujoco==3.3.1
+validate_inputs() {
+  [ -n "$REPO_ROOT" ] || die "set REPO_ROOT to the Zetta-Embodiment checkout"
+  [ -f "$REPO_ROOT/pyproject.toml" ] || die "REPO_ROOT ($REPO_ROOT) does not contain pyproject.toml"
+  [ -n "$VENV_ROOT" ] || die "set VENV_ROOT to the target virtual environment"
+  command -v "$UV_BIN" >/dev/null || die "uv was not found (set UV_BIN to its executable)"
+  if [ "$SELECTED_ENV" = robocasa ]; then require_source_directory robosuite; require_source_directory robocasa; fi
+  if [ "$SELECTED_MODEL" = gr00t ]; then require_source_directory Isaac-GR00T; fi
+}
 
-if [ "$TRACK" = "libero-pro" ]; then
-  log "3/9 [libero-pro] Install LIBERO-Pro (isolate its transitive rlinf-libero dependency)"
-  "$PY" -m pip install "$LIBEROPRO_PACKAGE" --no-deps
-  # Install every direct dependency from rpent-liberopro's wheel metadata except
-  # rlinf-libero. That distribution pulls in the main RLinf framework and conflicts
-  # with the intentionally isolated rlinf-openpi policy backend installed below.
-  # OpenCV 5 requires NumPy 2, while rpent-liberopro requires NumPy <2, so keep the
-  # last OpenCV series compatible with the benchmark's declared NumPy range.
-  "$PY" -m pip install \
-    "numpy>=1.22,<2" \
-    "opencv-python<4.12" \
-    "robosuite>=1.4,<1.5" \
-    "matplotlib>=3.5.3" \
-    bddl cloudpickle easydict filelock gym h5py huggingface-hub imageio pyyaml termcolor tqdm
+install_apt_packages() {
+  local apt=(apt-get)
+  if [ "$(id -u)" -ne 0 ]; then
+    command -v sudo >/dev/null || die "system dependency installation needs root or sudo; use --no-system-deps after installing them manually"
+    apt=(sudo apt-get)
+  fi
+  [ -r /etc/os-release ] || die "cannot detect the host distribution"
+  # shellcheck disable=SC1091
+  . /etc/os-release
+  case "${ID:-} ${ID_LIKE:-}" in *debian*|*ubuntu*) ;; *) die "automatic system dependency installation supports Debian/Ubuntu only; use --no-system-deps" ;; esac
+  "${apt[@]}" update
+  "${apt[@]}" install -y --no-install-recommends build-essential git curl ca-certificates ffmpeg libegl1-mesa-dev libgl1-mesa-dev libglib2.0-0
+}
 
-  log "3.1/9 [libero-pro] Fix: verify that robosuite is the 1.4.x series required by liberopro"
-  INSTALLED_ROBOSUITE="$("$PY" -m pip show robosuite 2>/dev/null | awk '/^Version:/{print $2}')"
-  case "$INSTALLED_ROBOSUITE" in
-    1.4.*) echo "robosuite==$INSTALLED_ROBOSUITE OK (liberopro requires <1.5.0,>=1.4.0)" ;;
-    *)
-      echo "Warning: robosuite==$INSTALLED_ROBOSUITE is not in the 1.4.x series. liberopro's" \
-           "BDDLBaseDomain(SingleArmEnv) raises ModuleNotFoundError under robosuite>=1.5" \
-           "(the module was refactored into manipulation_env.ManipulationEnv in 1.5.x, not renamed in place)." >&2
-      exit 1
-      ;;
-  esac
-else
-  log "3/9 [robocasa] Install robosuite==1.5.2 in editable mode (from ROBOCASA_SRC_ROOT)"
-  "$PY" -m pip install -e "$ROBOCASA_SRC_ROOT/robosuite" --no-deps
+has_shared_library() {
+  local library="$1"
+  command -v ldconfig >/dev/null && ldconfig -p 2>/dev/null | grep -F "$library" >/dev/null
+}
 
-  log "3.1/9 [robocasa] Install robocasa==1.0.1 in editable mode"
-  "$PY" -m pip install -e "$ROBOCASA_SRC_ROOT/robocasa"
+check_system_dependencies() {
+  local mode="$1" missing=()
+  command -v git >/dev/null || missing+=(git)
+  command -v gcc >/dev/null || missing+=(build-essential)
+  command -v ffmpeg >/dev/null || missing+=(ffmpeg)
+  has_shared_library libEGL.so.1 || missing+=(libegl1-mesa-dev)
+  has_shared_library libGL.so.1 || missing+=(libgl1-mesa-dev)
+  if [ "${#missing[@]}" -gt 0 ]; then
+    echo "Missing system dependencies: ${missing[*]}" >&2
+    echo "Ubuntu/Debian: sudo apt-get update && sudo apt-get install -y ${missing[*]}" >&2
+    [ "$mode" != strict ] || return 1
+    echo "Warning: --no-system-deps was used; an environment smoke test may fail." >&2
+  fi
+  command -v nvidia-smi >/dev/null || echo "Warning: nvidia-smi is unavailable; GPU inference may fail." >&2
+}
 
-  INSTALLED_ROBOSUITE="$("$PY" -m pip show robosuite 2>/dev/null | awk '/^Version:/{print $2}')"
-  case "$INSTALLED_ROBOSUITE" in
-    1.5.*) echo "robosuite==$INSTALLED_ROBOSUITE OK (robocasa requires >=1.5.0)" ;;
-    *)
-      echo "Warning: robosuite==$INSTALLED_ROBOSUITE is not in the 1.5.x series. robocasa's" \
-           "kitchen.py requires robosuite.models.robots.PandaOmron (introduced in 1.5.x)," \
-           "so environment creation will fail. See the ROBOCASA_SRC_ROOT compatibility" \
-           "matrix near the top of this script for the exact git ref to check out" \
-           "(ROBOCASA_SRC_ROOT/robosuite must be at tag v1.5.2, not main)." >&2
-      exit 1
-      ;;
-  esac
-fi
+prepare_system_dependencies() {
+  log "System dependencies"
+  if [ "$NO_SYSTEM_DEPS" -eq 0 ]; then install_apt_packages; check_system_dependencies strict
+  else check_system_dependencies warn; fi
+}
 
-log "4/9 Install this repository in editable mode (including the Zetta Ray runtime)"
-"$PY" -m pip install -e "${REPO_ROOT}[ray]"
+state_file() { printf '%s/.zetta-vla-components' "$VENV_ROOT"; }
+read_installed_environment() { [ -f "$(state_file)" ] && awk -F= '$1=="env" {print $2}' "$(state_file)" || true; }
+read_installed_model() { [ -f "$(state_file)" ] && awk -F= '$1=="model" {print $2}' "$(state_file)" || true; }
+effective_environment() {
+  if [ -n "$SELECTED_ENV" ]; then printf '%s\n' "$SELECTED_ENV"; else read_installed_environment; fi
+}
+effective_model() {
+  if [ -n "$SELECTED_MODEL" ]; then printf '%s\n' "$SELECTED_MODEL"; else read_installed_model; fi
+}
 
-if [ "$TRACK" = "libero-pro" ]; then
-  log "5/9 [libero-pro] Install rlinf-openpi (real openpi/pi0.5 inference; include all dependencies and do not use --no-deps)"
-  # Using --no-deps would omit tqdm_loggable, causing an immediate ModuleNotFoundError
-  # in openpi.shared.download. Installing all dependencies adds roughly 50 packages
-  # from the JAX/flax/orbax ecosystem, which openpi needs for weight loading and
-  # normalization.
-  "$PY" -m pip install rlinf-openpi==0.1.1
+configure_uv() {
+  UV_CACHE_DIR="${UV_CACHE_DIR:-$REPO_ROOT/.uv-cache}"
+  UV_PYTHON_INSTALL_DIR="${UV_PYTHON_INSTALL_DIR:-$REPO_ROOT/.uv-python}"
+  export UV_CACHE_DIR UV_PYTHON_INSTALL_DIR
+  mkdir -p "$UV_CACHE_DIR" "$UV_PYTHON_INSTALL_DIR"
+}
 
+setup_mirror() {
+  [ "$USE_MIRROR" -eq 1 ] || return 0
+  export UV_DEFAULT_INDEX="${UV_DEFAULT_INDEX:-https://mirrors.aliyun.com/pypi/simple}"
+  export HF_ENDPOINT="${HF_ENDPOINT:-https://hf-mirror.com}"
+  export GITHUB_PREFIX="${GITHUB_PREFIX:-https://gh-proxy.com/}"
+  export UV_PYTHON_INSTALL_MIRROR="${UV_PYTHON_INSTALL_MIRROR:-${GITHUB_PREFIX}https://github.com/astral-sh/python-build-standalone/releases/download}"
+  local idx="${GIT_CONFIG_COUNT:-0}"
+  export "GIT_CONFIG_KEY_${idx}=url.${GITHUB_PREFIX}github.com/.insteadOf"
+  export "GIT_CONFIG_VALUE_${idx}=https://github.com/"
+  export GIT_CONFIG_COUNT=$((idx + 1))
+}
+
+run_uv() { "$UV_BIN" "$@"; }
+uv_pip_install() { run_uv pip install --python "$PY" "$@"; }
+
+validate_existing_venv() {
+  local installed_env=""
+  if [ -e "$VENV_ROOT" ] && [ ! -x "$VENV_ROOT/bin/python" ]; then die "VENV_ROOT exists but is not a usable virtual environment: $VENV_ROOT"; fi
+  if [ -x "$VENV_ROOT/bin/python" ]; then
+    [ -f "$VENV_ROOT/pyvenv.cfg" ] && grep -Eq '^uv[[:space:]]*=' "$VENV_ROOT/pyvenv.cfg" || \
+      die "VENV_ROOT is not a uv-managed virtual environment: $VENV_ROOT"
+    grep -Eq "^(version_info|version)[[:space:]]*=[[:space:]]*${UV_PYTHON_VERSION}([.]|$)" "$VENV_ROOT/pyvenv.cfg" || \
+      die "VENV_ROOT must use uv-managed Python $UV_PYTHON_VERSION"
+  fi
+  if [ -x "$VENV_ROOT/bin/python" ] && [ -n "$SELECTED_ENV" ]; then
+    installed_env="$(read_installed_environment)"
+    if [ -n "$installed_env" ] && [ "$installed_env" != "$SELECTED_ENV" ]; then
+      die "this venv already contains '$installed_env'; '$SELECTED_ENV' needs an incompatible robosuite version"
+    fi
+  fi
+}
+
+create_venv() {
+  log "Python virtual environment"; validate_existing_venv
+  configure_uv
+  if [ ! -x "$VENV_ROOT/bin/python" ]; then
+    run_uv python install "$UV_PYTHON_VERSION"
+    run_uv venv --managed-python --python "$UV_PYTHON_VERSION" "$VENV_ROOT"
+  fi
+  PY="$VENV_ROOT/bin/python"
+}
+
+install_common_python_deps() {
+  log "Common Python dependencies"
+  uv_pip_install mujoco==3.3.1
+  uv_pip_install -e "${REPO_ROOT}[ray]"
+}
+
+verify_liberopro_suites() {
+  "$PY" - <<'PYEOF'
+from liberopro.liberopro import benchmark
+names = [f"libero_{f}_{v}" for f in ("spatial", "object", "goal", "10") for v in ("task", "swap", "lan", "object")]
+missing = sorted(set(names) - set(benchmark.get_benchmark_dict()))
+assert not missing, f"missing LIBERO-Pro perturbation suites: {missing}"
+for name in names:
+    suite = benchmark.get_benchmark(name)()
+    assert suite.get_num_tasks() > 0, name
+    assert suite.get_task(0).language.strip(), name
+    assert len(suite.get_task_init_states(0)) > 0, name
+print("LIBERO-Pro perturbation suites OK:", len(names))
+PYEOF
+}
+
+prepare_libero_assets() {
+  local composite pkg_root libero_assets robosuite_assets endpoint
+  composite="${LIBERO_COMPOSITE_ASSETS_DIR:-$VENV_ROOT/libero-pro-composite-assets}"
+  if [ "$SKIP_ASSET_DOWNLOAD" != 1 ]; then
+    endpoint="${HF_ENDPOINT:-https://huggingface.co}"
+    pkg_root="$("$PY" -c 'import os, liberopro; print(os.path.dirname(liberopro.__file__))')"
+    libero_assets="$pkg_root/liberopro/assets"
+    HF_ENDPOINT="$endpoint" \
+      "$PY" - "$libero_assets" "${LIBERO_PRO_ASSETS_REPO:-RLinf/LIBERO-PRO-assets}" "$endpoint" <<'PYEOF'
+import os
+import shutil
+import sys
+from pathlib import Path
+from huggingface_hub import HfApi, hf_hub_download
+
+assets_dir, repo_id, endpoint = sys.argv[1:]
+assets_root = Path(assets_dir)
+api = HfApi(endpoint=endpoint.rstrip("/"))
+files = []
+pending = [""]
+while pending:
+    current = pending.pop()
+    for attempt in range(6):
+        try:
+            entries = list(api.list_repo_tree(
+                repo_id,
+                path_in_repo=current or None,
+                repo_type="dataset",
+                recursive=False,
+            ))
+            break
+        except Exception:
+            if attempt == 5:
+                raise
+            import time
+            time.sleep(min(120, 10 * (2 ** attempt)))
+    for item in entries:
+        path = item.path
+        if hasattr(item, "size"):
+            files.append(path)
+        else:
+            pending.append(path)
+for relative in files:
+    destination = assets_root / relative
+    if destination.is_file():
+        continue
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    for attempt in range(6):
+        try:
+            cached = hf_hub_download(
+                repo_id=repo_id,
+                filename=relative,
+                repo_type="dataset",
+                endpoint=endpoint.rstrip("/"),
+                cache_dir=os.environ.get("HF_HOME"),
+            )
+            break
+        except Exception:
+            if attempt == 5:
+                raise
+            import time
+            time.sleep(min(120, 10 * (2 ** attempt)))
+    shutil.copy2(cached, destination)
+print("LIBERO-Pro assets downloaded via", endpoint, "files:", len(files))
+PYEOF
+    robosuite_assets="$("$PY" -c 'import os, robosuite; print(os.path.join(os.path.dirname(robosuite.__file__), "models", "assets"))')"
+    if [ ! -d "$composite" ]; then mkdir -p "$composite"; cp -a "$robosuite_assets/." "$composite/"; cp -a "$libero_assets/." "$composite/"; fi
+  fi
+  [ -f "$composite/robots/panda/robot.xml" ] || die "composite assets are missing robots/panda/robot.xml"
+  [ -f "$composite/scenes/libero_tabletop_base_style.xml" ] || die "composite assets are missing scenes/libero_tabletop_base_style.xml"
+  export LIBERO_ASSETS_ROOT_OVERRIDE="$composite"
+}
+
+install_libero_pro_env() {
+  log "Environment: LIBERO-Pro"
+  export LIBERO_CONFIG_PATH="${LIBERO_CONFIG_PATH:-$VENV_ROOT/.liberopro-config}"
+  uv_pip_install --no-deps "$LIBEROPRO_PACKAGE"
+  uv_pip_install "numpy>=1.22,<2" "opencv-python<4.12" "robosuite>=1.4,<1.5" "matplotlib>=3.5.3" torch bddl cloudpickle easydict filelock gym h5py huggingface-hub imageio pyyaml termcolor tqdm
+  local version; version="$("$PY" -c 'from importlib.metadata import version; print(version("robosuite"))')"
+  case "$version" in 1.4.*) ;; *) die "LIBERO-Pro requires robosuite 1.4.x, got '$version'" ;; esac
+  verify_liberopro_suites; prepare_libero_assets
+}
+
+install_robocasa_env() {
+  log "Environment: RoboCasa"
+  uv_pip_install --no-deps -e "$ROBOCASA_SRC_ROOT/robosuite"
+  uv_pip_install -e "$ROBOCASA_SRC_ROOT/robocasa"
+  "$PY" - <<'PYEOF'
+import robosuite
+from robosuite.models.robots import PandaOmron  # noqa: F401
+assert robosuite.__version__.startswith("1.5."), robosuite.__version__
+PYEOF
+}
+
+verify_openpi_distribution_guard() {
   "$PY" - <<'PYEOF'
 from importlib.metadata import distributions
 names = {str(item.metadata.get("Name", "")).lower() for item in distributions()}
 allowed = {"rlinf-openpi", "rlinf-transformer-openpi"}
-forbidden = sorted(
-    name
-    for name in names
-    if (name == "rlinf" or name.startswith("rlinf-")) and name not in allowed
-)
-if forbidden:
-    raise SystemExit(f"forbidden RLinf distributions installed: {forbidden}")
-print("RLinf distribution guard OK: only the OpenPI packages are installed")
+bad = sorted(n for n in names if (n == "rlinf" or n.startswith("rlinf-")) and n not in allowed)
+assert not bad, f"forbidden RLinf distributions installed: {bad}"
 PYEOF
+}
 
-  log "5.1/9 [libero-pro] Fix: rlinf-openpi's dependency chain silently upgrades mujoco to 3.8.1; restore 3.3.1"
-  # The transitive gym-aloha -> dm-control dependency upgrades mujoco to 3.8.1, but
-  # openpi itself does not use mujoco at import time (this is only an unused version
-  # constraint declared by gym-aloha). LIBERO-Pro needs mujoco to remain at 3.3.1.
-  "$PY" -m pip install mujoco==3.3.1 --force-reinstall --no-deps
-  "$PY" -m pip install "numpy>=1.22,<2"
-else
-  log "5/9 [robocasa] Install gr00t==1.1.0 in editable mode (from ROBOCASA_SRC_ROOT)"
-  "$PY" -m pip install -e "$ROBOCASA_SRC_ROOT/Isaac-GR00T"
+restore_mujoco_pin() { uv_pip_install --reinstall --no-deps mujoco==3.3.1; }
 
-  log "5.1/9 [robocasa] Fix: ensure gr00t's dependency chain did not change mujoco indirectly"
-  "$PY" -m pip install mujoco==3.3.1 --force-reinstall --no-deps
+install_openpi_model() {
+  log "Model: OpenPI"
+  uv_pip_install rlinf-openpi==0.1.1
+  verify_openpi_distribution_guard; restore_mujoco_pin
+}
 
-  log "5.2/9 [robocasa] Install flash-attn (a hard dependency of GR00T's Eagle vision backbone, with no CPU fallback)"
-  # Official releases provide only source distributions or prebuilt wheels that must
-  # match the torch/CUDA/Python ABI exactly. When selecting a wheel, its torch, cuXX,
-  # cpXXX, and cxx11abi{TRUE,FALSE} fields must exactly match torch.__version__,
-  # torch.version.cuda, the Python version, and torch._C._GLIBCXX_USE_CXX11_ABI in
-  # this venv. Installing the wrong version causes undefined-symbol errors during
-  # import instead of a clear version-mismatch message.
-  if [ -n "$FLASH_ATTN_WHEEL" ]; then
-    "$PY" -m pip install "$FLASH_ATTN_WHEEL"
-  else
-    TORCH_VER="$("$PY" -c 'import torch; print(torch.__version__.split("+")[0])')"
-    CUDA_VER="$("$PY" -c 'import torch; print(torch.version.cuda.replace(".", ""))' | cut -c1-2)"
-    PY_TAG="$("$PY" -c 'import sys; print(f"cp{sys.version_info.major}{sys.version_info.minor}")')"
-    CXX11ABI="$("$PY" -c 'import torch; print("TRUE" if torch._C._GLIBCXX_USE_CXX11_ABI else "FALSE")')"
-    FLASH_ATTN_VERSION="2.8.3"
-    DEFAULT_URL="https://github.com/Dao-AILab/flash-attention/releases/download/v${FLASH_ATTN_VERSION}/flash_attn-${FLASH_ATTN_VERSION}+cu${CUDA_VER}torch${TORCH_VER}cxx11abi${CXX11ABI}-${PY_TAG}-${PY_TAG}-linux_x86_64.whl"
-    echo "FLASH_ATTN_WHEEL is not set; trying the default URL: $DEFAULT_URL"
-    echo "If the build host cannot reach github.com directly, download the wheel through a proxy" \
-         "such as gh-proxy.org, then rerun this script with FLASH_ATTN_WHEEL=<local-path>."
-    "$PY" -m pip install "$DEFAULT_URL"
-  fi
+flash_attn_default_url() {
+  local torch_tag cuda_tag python_tag cxx11abi version=2.8.3
+  torch_tag="$("$PY" -c 'import torch; print(".".join(torch.__version__.split("+")[0].split(".")[:2]))')"
+  cuda_tag="$("$PY" -c 'import torch; print((torch.version.cuda or "").split(".")[0])')"
+  [ -n "$cuda_tag" ] || die "GR00T flash-attn requires CUDA torch"
+  python_tag="$("$PY" -c 'import sys; print(f"cp{sys.version_info.major}{sys.version_info.minor}")')"
+  cxx11abi="$("$PY" -c 'import torch; print("TRUE" if torch._C._GLIBCXX_USE_CXX11_ABI else "FALSE")')"
+  printf 'https://github.com/Dao-AILab/flash-attention/releases/download/v%s/flash_attn-%s+cu%storch%scxx11abi%s-%s-%s-linux_x86_64.whl' "$version" "$version" "$cuda_tag" "$torch_tag" "$cxx11abi" "$python_tag" "$python_tag"
+}
 
-  log "5.3/9 [robocasa] Fix: ensure transformers is the genuine build (not stale files shadowed in the same directory)"
-  # The rlinf-openpi/lerobot dependency chain installs a package named
-  # rlinf-transformer-openpi. It has the same PyPI metadata as the real transformers
-  # library and installs into the same site-packages/transformers/ directory, physically
-  # overwriting the genuine transformers==4.51.3 files (while pip's package records
-  # incorrectly report an unchanged version). Force-reinstall the genuine files here.
-  "$PY" -m pip install transformers==4.51.3 --force-reinstall --no-deps
-fi
+install_gr00t_model() {
+  log "Model: GR00T"
+  uv_pip_install -e "$ROBOCASA_SRC_ROOT/Isaac-GR00T"; restore_mujoco_pin
+  if [ -n "$FLASH_ATTN_WHEEL" ]; then uv_pip_install "$FLASH_ATTN_WHEEL"; else uv_pip_install "$(flash_attn_default_url)"; fi
+  uv_pip_install --reinstall --no-deps transformers==4.51.3
+}
 
-log "5.4/9 Fix: numpydantic schema generation is incompatible with newer pydantic; downgrade pydantic"
-# Both tracks indirectly install pydantic 2.13.x, at which point numpydantic raises
-# the following errors while generating a schema:
-#   pydantic._internal._generate_schema.InvalidSchemaError /
-#   MissingDefinitionError: any-shape-array-...
-# Downgrade to 2.10.6 and let pip resolve a matching pydantic-core (do not use --no-deps).
-"$PY" -m pip install "pydantic==2.10.6"
+install_robocasa_groot_finder_fix() {
+  local site_packages; site_packages="$("$PY" -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')"
+  printf '%s\n' 'import sys; exec("def _fix():\n gi=ri=None\n for i,f in enumerate(sys.meta_path):\n  m=getattr(f,'"'"'__module__'"'"',None)\n  if m=='"'"'__editable___gr00t_1_1_0_finder'"'"': gi=i\n  elif m=='"'"'__editable___robocasa_1_0_1_finder'"'"': ri=i\n if gi is None or ri is None or ri<gi: return\n sys.meta_path.insert(gi,sys.meta_path.pop(ri))\n_fix()")' > "$site_packages/zzz_robocasa_finder_precedence_fix.pth"
+}
 
-if [ "$TRACK" = "robocasa" ]; then
-  log "5.5/9 [robocasa] Fix: robocasa/gr00t top-level package shadowing (sys.meta_path precedence)"
-  # Root cause: gr00t and robocasa are both editable installs. Their respective
-  # __editable__.<name>.pth files execute alphabetically at interpreter startup, so
-  # gr00t's finder precedes robocasa's finder. As a result, `import robocasa` resolves
-  # to a lightweight overlay package bundled with gr00t (with only one registered
-  # environment), not the real robocasa/__init__.py at the repository root (with 374
-  # registered task environments). Submodule imports such as
-  # robocasa.environments.kitchen resolve correctly through the overlay package's
-  # pkgutil.extend_path fallback, but the top-level __init__.py body never executes,
-  # causing gym.make("robocasa/<task>") to report
-  # "Environment `<task>` doesn't exist in namespace robocasa".
-  #
-  # Fix: install a .pth file that reorders sys.meta_path at interpreter startup and
-  # moves robocasa's finder before gr00t's finder. A .pth file is used instead of
-  # sitecustomize.py because the system version under /usr/lib/python3.10 is found
-  # first in this venv (the system directory precedes the venv's site-packages in
-  # sys.path). The .pth file's single-line exec() statement runs directly while the
-  # site module is processing and affects every process using this venv, including
-  # Ray worker subprocesses.
-  SITE_PACKAGES="$("$PY" -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')"
-  cat > "$SITE_PACKAGES/zzz_robocasa_finder_precedence_fix.pth" <<'PTHEOF'
-import sys; exec("def _fix():\n import sys\n gi=ri=None\n for i,f in enumerate(sys.meta_path):\n  m=getattr(f,'__module__',None)\n  if m=='__editable___gr00t_1_1_0_finder': gi=i\n  elif m=='__editable___robocasa_1_0_1_finder': ri=i\n if gi is None or ri is None or ri<gi: return\n sys.meta_path.insert(gi, sys.meta_path.pop(ri))\n_fix()")
-PTHEOF
-  "$PY" -c "
-import robocasa
-from robocasa.environments.kitchen.kitchen import REGISTERED_KITCHEN_ENVS
-assert len(REGISTERED_KITCHEN_ENVS) > 1, (
-    f'robocasa top-level package shadowing fix failed; only {len(REGISTERED_KITCHEN_ENVS)} environments were registered'
-)
-print('robocasa top-level package shadowing fix OK; registered environments:', len(REGISTERED_KITCHEN_ENVS))
-"
-fi
-
-log "6/9 Verify core dependency versions"
-"$PY" - <<PYEOF
-import mujoco, robosuite, pydantic, rollout_runtime  # noqa: F401
-print("mujoco   ", mujoco.__version__)
-print("robosuite", robosuite.__version__)
-print("pydantic ", pydantic.VERSION)
-print("rollout_runtime", rollout_runtime.__file__)
-if "$TRACK" == "libero-pro":
-    import openpi
-    print("openpi   ", openpi.__file__)
-else:
-    import gr00t, flash_attn, transformers.image_utils as iu
-    import inspect
-    assert "VideoInput" in inspect.getsource(iu), (
-        "transformers files were overwritten; repeat the force-reinstall in step 5.3"
-    )
-    print("gr00t    ", gr00t.__file__)
-    print("flash_attn", flash_attn.__version__)
-    print("transformers image_utils OK, VideoInput present")
-PYEOF
-
-log "6.1/9 Verify the Zetta OpenPI implementation and openpi distribution"
-"$PY" - <<PYEOF
-import sys
-sys.path.insert(0, "${REPO_ROOT}")
-import openpi
-from zetta.policies.openpi.factory import build_openpi_model
-print("openpi distribution OK:", openpi.__file__)
-print("zetta OpenPI factory OK:", build_openpi_model.__module__)
-PYEOF
-
-if [ "$TRACK" = "libero-pro" ]; then
-  log "7/9 [libero-pro] Download LIBERO-Pro scene assets and build the composite asset tree (robosuite robot models + LIBERO-Pro scene/object assets)"
-  # Root cause: robots/libero/assets.py::bind_libero_assets_root() (the runtime binding
-  # point for LIBERO_ASSETS_ROOT_OVERRIDE) has no fallback logic. It redirects all of
-  # robosuite.models.assets_root to the override directory and does not fall back to
-  # assets bundled with robosuite when files are missing there. liberopro robot classes
-  # such as mounted_panda.py use `xml_path_completion("robots/panda/robot.xml")`. This
-  # XML, together with obj_meshes/ and meshes/, exists only under robosuite's own
-  # `models/assets/robots/`. The LIBERO-PRO-assets dataset fetched by
-  # liberopro-download-assets contains only scenes and objects (scenes/,
-  # articulated_objects/, etc.), not robot models. Passing raw liberopro assets alone
-  # to LIBERO_ASSETS_ROOT_OVERRIDE causes environment reset to report:
-  #   FileNotFoundError: .../assets/robots/panda/robot.xml
-  # This was reproduced on a real A100 host during a real 300-action
-  # libero_goal_swap/task3 rollout. Fix: build a composite asset tree using the
-  # models/assets bundled with robosuite as the base and merge the assets downloaded
-  # by liberopro on top. Both contain a textures/ directory; the liberopro version
-  # should take precedence because it contains the more specialized scene textures.
-  COMPOSITE_ASSETS="${LIBERO_COMPOSITE_ASSETS_DIR:-$VENV_ROOT/libero-pro-composite-assets}"
-  if [ "$SKIP_ASSET_DOWNLOAD" = "1" ]; then
-    echo "SKIP_ASSET_DOWNLOAD=1; using the existing composite asset tree: $COMPOSITE_ASSETS"
-  else
-    "$VENV_ROOT/bin/liberopro-download-assets" --skip-existing
-    LIBEROPRO_PKG_ROOT="$("$PY" -c 'import os, liberopro; print(os.path.dirname(liberopro.__file__))')"
-    LIBEROPRO_ASSETS="$LIBEROPRO_PKG_ROOT/liberopro/assets"
-    ROBOSUITE_ASSETS="$("$PY" -c 'import os, robosuite; print(os.path.join(os.path.dirname(robosuite.__file__), "models", "assets"))')"
-    if [ -d "$COMPOSITE_ASSETS" ]; then
-      echo "The composite asset directory already exists; skipping rebuild: $COMPOSITE_ASSETS"
+apply_compatibility_fixes() {
+  log "Compatibility fixes"
+  local environment model
+  environment="$(effective_environment)"; model="$(effective_model)"
+  [ -z "$model" ] || uv_pip_install pydantic==2.10.6
+  if [ "$environment" = libero-pro ] && [ -n "$model" ]; then
+    uv_pip_install "numpy>=1.22,<2"
+    uv_pip_install --no-deps "robosuite>=1.4,<1.5"
+  elif [ "$environment" = robocasa ] && [ -n "$model" ]; then
+    if [ -d "$ROBOCASA_SRC_ROOT/robosuite" ]; then
+      uv_pip_install --no-deps -e "$ROBOCASA_SRC_ROOT/robosuite"
     else
-      mkdir -p "$COMPOSITE_ASSETS"
-      cp -a "$ROBOSUITE_ASSETS/." "$COMPOSITE_ASSETS/"
-      cp -a "$LIBEROPRO_ASSETS/." "$COMPOSITE_ASSETS/"
-      echo "Composite asset tree built: $COMPOSITE_ASSETS"
+      uv_pip_install --no-deps "robosuite>=1.5,<1.6"
     fi
   fi
-  test -f "$COMPOSITE_ASSETS/robots/panda/robot.xml" || {
-    echo "The composite asset tree is missing robots/panda/robot.xml (the robosuite base was not copied correctly)" >&2
-    exit 1
-  }
-  test -f "$COMPOSITE_ASSETS/scenes/libero_tabletop_base_style.xml" || {
-    echo "The composite asset tree is missing scenes/libero_tabletop_base_style.xml (the liberopro scenes were not copied correctly)" >&2
-    exit 1
-  }
-  export LIBERO_ASSETS_ROOT_OVERRIDE="$COMPOSITE_ASSETS"
-  echo "Composite asset tree validated (robosuite robot models and LIBERO-Pro scene assets are present)."
-  echo "Using LIBERO_ASSETS_ROOT_OVERRIDE=$LIBERO_ASSETS_ROOT_OVERRIDE for the reset smoke test."
+  [ -z "$model" ] || restore_mujoco_pin
+  if [ "$environment" = robocasa ] && [ "$model" = gr00t ]; then install_robocasa_groot_finder_fix; fi
+}
 
-  log "8/9 [libero-pro] Minimal import/environment creation smoke test (no real VLA checkpoint required)"
+record_installed_components() {
+  local installed_env installed_model=""
+  installed_env="$(read_installed_environment)"
+  [ ! -f "$(state_file)" ] || installed_model="$(awk -F= '$1=="model" {print $2}' "$(state_file)")"
+  [ -z "$SELECTED_ENV" ] || installed_env="$SELECTED_ENV"
+  [ -z "$SELECTED_MODEL" ] || installed_model="$SELECTED_MODEL"
+  printf 'env=%s\nmodel=%s\n' "$installed_env" "$installed_model" > "$(state_file)"
+}
+
+verify_libero_environment() {
+  export LIBERO_CONFIG_PATH="${LIBERO_CONFIG_PATH:-$VENV_ROOT/.liberopro-config}"
+  export LIBERO_ASSETS_ROOT_OVERRIDE="${LIBERO_ASSETS_ROOT_OVERRIDE:-${LIBERO_COMPOSITE_ASSETS_DIR:-$VENV_ROOT/libero-pro-composite-assets}}"
   "$PY" - <<'PYEOF'
 import os
 os.environ.setdefault("MUJOCO_GL", "egl")
 from robots.libero.assets import bind_libero_assets_root
-
 bind_libero_assets_root(os.environ["LIBERO_ASSETS_ROOT_OVERRIDE"])
+from liberopro.liberopro import benchmark
+from liberopro.liberopro import get_libero_path
 from liberopro.liberopro.envs import OffScreenRenderEnv
-import glob
-
-bddl_candidates = glob.glob(
-    os.path.join(
-        os.path.dirname(__import__("liberopro").__file__),
-        "liberopro", "bddl_files", "libero_10", "*.bddl",
-    )
-)
-if not bddl_candidates:
-    raise SystemExit("No packaged bddl task files were found; the liberopro installation may be incomplete")
-
-env = OffScreenRenderEnv(
-    bddl_file_name=bddl_candidates[0],
-    camera_heights=128,
-    camera_widths=128,
-)
-env.seed(0)
-obs = env.reset()
-assert obs is not None
-env.close()
-print("LIBERO-Pro environment create/reset/close succeeded:", bddl_candidates[0])
+task = benchmark.get_benchmark("libero_10")().get_task(0)
+bddl_path = os.path.join(get_libero_path("bddl_files"), task.problem_folder, task.bddl_file)
+assert os.path.isfile(bddl_path), bddl_path
+env = OffScreenRenderEnv(bddl_file_name=bddl_path)
+env.seed(0); assert env.reset() is not None; env.close()
 PYEOF
-else
-  log "7-8/9 [robocasa] Minimal environment creation smoke test (no real GR00T checkpoint required)"
+}
+
+verify_robocasa_environment() {
   "$PY" - <<'PYEOF'
 import os
 os.environ.setdefault("MUJOCO_GL", "egl")
-import robosuite
-import robocasa
+import robocasa  # noqa: F401
 from robosuite.environments.base import make
-
-env = make(
-    env_name="PickPlaceCounterToCabinet",
-    robots="PandaOmron",
-    has_renderer=False,
-    has_offscreen_renderer=False,
-    use_camera_obs=False,
-    ignore_done=True,
-)
-obs = env.reset()
-assert obs is not None
-env.close()
-print("RoboCasa environment create/reset/close succeeded")
+env = make(env_name="PickPlaceCounterToCabinet", robots="PandaOmron", has_renderer=False, has_offscreen_renderer=False, use_camera_obs=False, ignore_done=True)
+assert env.reset() is not None; env.close()
 PYEOF
-fi
+}
 
-log "9/9 Complete"
-if [ "$TRACK" = "libero-pro" ]; then
-cat <<EOF
+verify_openpi_model() {
+  "$PY" - <<PYEOF
+import sys
+sys.path.insert(0, "${REPO_ROOT}")
+import openpi
+from zetta.policies.openpi.factory import build_openpi_model
+print(openpi.__file__, build_openpi_model.__module__)
+PYEOF
+}
 
-venv is ready: $VENV_ROOT
+verify_gr00t_model() {
+  "$PY" - <<'PYEOF'
+import inspect, flash_attn, gr00t, transformers.image_utils as iu
+assert "VideoInput" in inspect.getsource(iu)
+print(gr00t.__file__, flash_attn.__version__)
+PYEOF
+}
 
-Next steps (a real Pi0.5 checkpoint is required and is not provided by this script).
-For a real rollout, LIBERO_ASSETS_ROOT_OVERRIDE must point to the composite asset tree
-built in step 7; otherwise, environment reset will raise FileNotFoundError because
-the robosuite robot models are missing:
-  cd "$REPO_ROOT"
-  export LIBERO_CONFIG_PATH="$LIBERO_CONFIG_PATH"
-  export LIBERO_ASSETS_ROOT_OVERRIDE="${LIBERO_COMPOSITE_ASSETS_DIR:-$VENV_ROOT/libero-pro-composite-assets}"
-  "$PY" scripts/experiments/libero_critic_recovery_latency_v3.py \\
-    --output /tmp/libero-pi05-smoke \\
-    --seed 0 \\
-    --env-cuda-device 0 \\
-    --rollout-cuda-device 0 \\
-    --model-path /abs/path/to/RLinf-Pi05-LIBERO-checkpoint \\
-    --max-actions 20 \\
-    --no-video
-EOF
-else
-cat <<EOF
+verify_dependency_consistency() {
+  local output line unexpected="" known=0
+  if output="$(run_uv pip check --python "$PY" 2>&1)"; then
+    printf '%s\n' "$output"
+    return 0
+  fi
+  printf '%s\n' "$output"
+  while IFS= read -r line; do
+    case "$line" in
+      "The package \`openai-codex\` requires \`pydantic"*|\
+      "The package \`mcp\` requires \`pydantic"*|\
+      "The package \`pydantic-ai-slim\` requires \`pydantic"*|\
+      "The package \`pydantic-graph\` requires \`pydantic"*|\
+      "The package \`dm-control\` requires \`mujoco"*|\
+      "The package \`rpent-liberopro\` requires \`rlinf-libero"*)
+        known=$((known + 1)) ;;
+      ""|"Using Python "*|"Checked "*|"Found "*) ;;
+      *) unexpected+="${unexpected:+$'\n'}$line" ;;
+    esac
+  done <<< "$output"
+  [ -z "$unexpected" ] || die "unexpected dependency incompatibility:\n$unexpected"
+  echo "Known compatibility exceptions: $known"
+}
 
-venv is ready: $VENV_ROOT
+verify_installation() {
+  local environment model
+  log "Verification"
+  "$PY" - <<'PYEOF'
+import mujoco, rollout_runtime
+assert mujoco.__version__ == "3.3.1", mujoco.__version__
+print("mujoco", mujoco.__version__, "rollout_runtime", rollout_runtime.__file__)
+PYEOF
+  environment="$(effective_environment)"; model="$(effective_model)"
+  case "$environment" in libero-pro) verify_libero_environment ;; robocasa) verify_robocasa_environment ;; esac
+  case "$model" in openpi) verify_openpi_model ;; gr00t) verify_gr00t_model ;; esac
+  verify_dependency_consistency
+  record_installed_components
+}
 
-Next steps (a real GR00T checkpoint and a rollout_runtime serve preset referencing
-local paths are required and are not provided by this script):
-  cd "$REPO_ROOT"
-  "$PY" -m rollout_runtime.cli serve \\
-    --config <your-preset> --host 127.0.0.1 --port 18730 --launch ray
-  "$PY" scripts/evolution/pnp_latency_v3.py \\
-    --runtime-url http://127.0.0.1:18730 --seed 0 \\
-    --max-actions 20 --actions-per-chunk 5
-EOF
-fi
+print_next_steps() {
+  local environment
+  environment="$(effective_environment)"
+  log "Complete"; echo "venv is ready: $VENV_ROOT"
+  [ -z "$SELECTED_ENV" ] || echo "environment: $SELECTED_ENV"
+  [ -z "$SELECTED_MODEL" ] || echo "model: $SELECTED_MODEL"
+  if [ "$environment" = libero-pro ]; then
+    echo "export LIBERO_CONFIG_PATH=${LIBERO_CONFIG_PATH:-$VENV_ROOT/.liberopro-config}"
+    echo "export LIBERO_ASSETS_ROOT_OVERRIDE=${LIBERO_COMPOSITE_ASSETS_DIR:-$VENV_ROOT/libero-pro-composite-assets}"
+  fi
+}
 
-echo
-echo "Known limitation: the libero-pro and robocasa tracks cannot be installed in the same venv state" \
-     "because their robosuite versions conflict at the code level. See the Known Limitations section in VLA_ENV_SETUP.md."
-echo "RoboTwin is a third, separately isolated environment: it is SAPIEN-based rather than robosuite-based," \
-     "so this script does not build it. Use the upstream RLinf image instead; see docs/robotwin.md."
+main() {
+  local parse_status=0
+  parse_args "$@" || parse_status=$?
+  if [ "$parse_status" -eq 2 ]; then return 0; elif [ "$parse_status" -ne 0 ]; then return "$parse_status"; fi
+  validate_inputs; setup_mirror; prepare_system_dependencies; create_venv; install_common_python_deps
+  case "$SELECTED_ENV" in libero-pro) install_libero_pro_env ;; robocasa) install_robocasa_env ;; esac
+  case "$SELECTED_MODEL" in openpi) install_openpi_model ;; gr00t) install_gr00t_model ;; esac
+  apply_compatibility_fixes; verify_installation; print_next_steps
+}
+
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then main "$@"; fi

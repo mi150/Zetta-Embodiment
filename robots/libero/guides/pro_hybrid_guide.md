@@ -93,8 +93,17 @@ from the repository root:
 ```bash
 export REPO_ROOT="$PWD"
 export VENV_ROOT=/abs/path/to/venvs/libero-pro
-bash scripts/deployment/install_vla_env.sh --track libero-pro
+bash scripts/deployment/install_vla_env.sh --env libero-pro --model openpi
 ```
+
+The installer prepares the required Debian/Ubuntu system packages by default.
+Use `--no-system-deps` when the compiler, ffmpeg, EGL, and OpenGL libraries are
+already managed by the host.
+
+Python is managed entirely by `uv`: the installer obtains Python 3.11, creates
+the target venv, and installs packages without using the host Python or pip.
+On slow networks, append `--use-mirror` to use the RLinf-compatible download
+mirrors.
 
 The installer uses the `rpent-liberopro==0.1.1` distribution (which provides
 the `liberopro` import package), installs the compatible robosuite and Pi0.5
@@ -113,7 +122,7 @@ perception-specific to install beyond the PRO environment.
 ### 2.1. Verify the installed version
 
 ```bash
-"$VENV_ROOT/bin/python" -m pip show rpent-liberopro
+uv pip show --python "$VENV_ROOT/bin/python" rpent-liberopro
 # Name: rpent-liberopro
 # Version: 0.1.1
 ```
